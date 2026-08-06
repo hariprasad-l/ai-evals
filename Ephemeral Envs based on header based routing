@@ -1,0 +1,42 @@
+Context & Problem Statement
+Currently, our parallel AI development cycles suffer from deployment collisions where concurrent feature branch deployments overwrite or interfere with each other in shared staging or development environments.
+
+However, traditional approaches to ephemeral environments (such as provisioning a unique subdomain per PR, e.g., pr-123.api.company.com) introduce massive operational overhead:
+Upstream services require continuous domain whitelisting updates.
+Frontend CORS configurations break or require dynamic origin echoing.
+Managing dozens of distinct TLS certificates and DNS records complicates CI/CD.
+2. Proposed Solution
+We propose implementing a Context-Aware Routing Layer using our existing AWS Application Load Balancer (ALB). This preserves a single, static domain (api.company.com) while allowing developers to spin up completely isolated backend workloads mapped dynamically via request identifiers.
+
+Key Mechanism
+Routing Identifiers: Requests are matched using either:
+HTTP Header: X-Environment-ID: pr-123
+Query Parameter: ?env=pr-123
+Dynamic Target Groups: When a PR opens, CI/CD provisions a dedicated target group, registers the ephemeral ECS task or EKS pod, and creates temporary ALB listener rules.
+Baseline Protection: The develop branch pipeline remains strictly decoupled, updating only the stable production/staging baseline target group. Feature branches have zero access to the baseline infrastructure.
+3. Workflow Architecture
+A. Develop Branch Merge (Baseline Deployment)
+Code is pushed/merged directly into the develop branch.
+CI/CD triggers a rolling update to the stable ECS/EKS service.
+The Baseline Target Group is updated with the new stable containers. Feature branch environments cannot touch this path.
+B. Feature Branch Pull Request (Ephemeral Environment)
+A pull request is opened against develop.
+CI/CD builds the AI service and spawns an isolated ECS task or EKS pod.
+A unique target group (pr-<PR_NUM>-tg) is provisioned.
+The ephemeral workload IP is registered to the target group.
+Two ALB listener rules are programmatically added:
+Rule 1 (Header match): X-Environment-ID: pr-<PR_NUM> → Forward to ephemeral target group.
+Rule 2 (Query param match): env=pr-<PR_NUM> → Forward to ephemeral target group.
+Developers test locally or via browser extension headers against the standard static domain (api.company.com).
+C. Teardown Lifecycle
+Primary Trigger: When a PR is closed or merged, the CI/CD pipeline executes a teardown script that deletes the specific ALB listener rules, deletes the dynamic target group, and terminates the underlying container workload.
+Safety Net: A scheduled daily cleanup job sweeps for orphaned target groups or rules tagged with ManagedBy: CICD exceeding a 48-hour TTL.
+4. Advantages Over Alternative Approaches
+Zero Upstream Friction: Upstream service providers and CORS policies remain untouched because the public-facing domain never changes.
+Cost Efficiency: No heavy, fully duplicated duplicate environments are running 24/7; only active PR workloads consume compute resources.
+Low Infrastructure Complexity: By leveraging native AWS ALB listener rules, we avoid the heavy operational overhead of introducing external proxies (like Traefik/Envoy) or complex service meshes (like Istio) at our current scale.
+5. Risks, Mitigations & Limits
+ALB Listener Rule Limit: AWS enforces a hard limit of 100 listener rules per listener.
+Mitigation: At a peak of 10 concurrent PRs, we will consume roughly 20 rules (2 rules per PR), keeping us safely at 20% capacity. If our concurrency scales beyond 40+ PRs in the future, we will graduate to an Envoy proxy architecture.
+Orphaned Resources: Failed pipeline deletions could leave stale rules.
+Mitigation: Strict resource tagging (PRNumber, ManagedBy) combined with automated cron-based garbage collection.
